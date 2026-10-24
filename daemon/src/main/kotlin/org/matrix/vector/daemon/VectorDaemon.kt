@@ -193,7 +193,21 @@ object VectorDaemon {
             Log.i(TAG, "Successfully injected Vector IPC binder for applications.")
           } else {
             Log.e(TAG, "Failed to inject VectorService into system_server")
-            if (restartRetry > 0) restartSystemServer()
+            // Restarting is a recovery only when our module is in system_server and the
+            // handshake went wrong, because the replacement is specialized by the same hooked
+            // zygote and gets another try. When no module reached system_server in the first
+            // place the hooks are not there, so every restart takes the user's screen down and
+            // arrives back here; the retry budget then spends itself on a row of them.
+            //
+            // `systemServerRequested` separates the two: the module latches it from inside
+            // `postServerSpecialize`, which runs before system_server starts a single service,
+            // while the loop above only transacts once `activity` answers a ping. So a live
+            // `activity` with no handshake behind it means no module, not a race.
+            when {
+              !SystemServerService.systemServerRequested ->
+                  Log.e(TAG, "No Vector module reached system_server; leaving it running")
+              restartRetry > 0 -> restartSystemServer()
+            }
           }
         }
         .onFailure { Log.e(TAG, "Error during injecting DaemonService", it) }
