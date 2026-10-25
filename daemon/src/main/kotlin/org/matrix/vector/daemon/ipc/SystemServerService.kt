@@ -7,11 +7,25 @@ import android.os.IServiceCallback
 import android.os.Parcel
 import android.os.ServiceManager
 import android.util.Log
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.matrix.vector.ipc.IFrameworkService
 import org.matrix.vector.daemon.*
 import org.matrix.vector.daemon.system.getSystemServiceManager
 
 private const val TAG = "VectorSystemServer"
+
+/**
+ * How long to leave between attempts at dropping the proxy, and how many to make.
+ *
+ * servicemanager marks a service the moment it hands the binder out and refuses to unregister it
+ * until that mark is cleared, which it does from a five second interval of its own. Asking once,
+ * straight after the handshake, therefore always lands inside the mark; these space the asking out
+ * across a few of those intervals instead.
+ */
+private const val UNREGISTER_RETRY_MILLIS = 6_000L
+private const val UNREGISTER_ATTEMPTS = 5
 
 /**
  * The Android R half of [SystemServerService.registerProxyService], in a class of its own on
@@ -43,6 +57,10 @@ private object ServiceRegistrationWatcher {
     runCatching { getSystemServiceManager().registerForNotifications(serviceName, callback) }
         .onFailure { Log.e(TAG, "Failed to register IServiceCallback", it) }
   }
+
+  fun unregister(serviceName: String, binder: IBinder) {
+    getSystemServiceManager().tryUnregisterService(serviceName, binder)
+  }
 }
 
 /**
@@ -58,6 +76,7 @@ object SystemServerService : Binder(), IBinder.DeathRecipient {
 
   private var proxyServiceName: String? = null
   private var originService: IBinder? = null
+  private var unregisterJob: Job? = null
 
   var systemServerRequested = false
 
@@ -78,6 +97,37 @@ object SystemServerService : Binder(), IBinder.DeathRecipient {
           proxyServiceName = serviceName
         }
         .onFailure { Log.e(TAG, "Failed to register proxy service `$serviceName`", it) }
+  }
+
+  /**
+   * Drops our proxy from servicemanager, once the module it was there for has been served.
+   *
+   * Best effort, and asked more than once: `tryUnregisterService` arrived in Android R, and
+   * servicemanager refuses while the service is still marked as having a client on the way, which
+   * the handshake we have just finished is exactly what put there. See [UNREGISTER_RETRY_MILLIS].
+   *
+   * Worth the trouble because the name invented for a late injection is ours alone, so unlike
+   * `serial` nothing will ever come along and replace it. A refusal costs nothing: the name stays
+   * registered, as it did before any of this.
+   */
+  fun unregisterProxyService() {
+    val name = proxyServiceName ?: return
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+    unregisterJob?.cancel()
+    unregisterJob =
+        VectorDaemon.scope.launch {
+          repeat(UNREGISTER_ATTEMPTS) { attempt ->
+            if (attempt > 0) delay(UNREGISTER_RETRY_MILLIS)
+            val failure =
+                runCatching { ServiceRegistrationWatcher.unregister(name, SystemServerService) }
+                    .exceptionOrNull()
+            if (failure == null) {
+              Log.d(TAG, "Dropped the proxy service `$name`")
+              return@launch
+            }
+            Log.d(TAG, "Proxy service `$name` stays registered: $failure")
+          }
+        }
   }
 
   /**
@@ -148,6 +198,10 @@ object SystemServerService : Binder(), IBinder.DeathRecipient {
   }
 
   override fun binderDied() {
+    // A pending attempt belongs to the handshake of the system_server that has just died. The
+    // caller re-claims the name for its replacement right after this, and dropping that
+    // registration would leave the replacement with nowhere to meet us.
+    unregisterJob?.cancel()
     originService?.unlinkToDeath(this, 0)
     originService = null
   }

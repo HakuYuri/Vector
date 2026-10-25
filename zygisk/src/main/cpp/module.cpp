@@ -415,9 +415,14 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
 
     // --- Framework Injection for System Server ---
     auto &ipc_bridge = IPCBridge::GetInstance();
-    std::string bridgeServiceName = "serial";
-    bool is_late_inject = (args->runtime_flags & RuntimeFlags::LATE_INJECT) != 0;
-    if (is_late_inject) bridgeServiceName = "serial_vector";
+    // Zygisk says so itself when it attached to a running system_server. Implementations that do
+    // not set the flag are caught by the fallback, an already serving system_server being the one
+    // thing a late injection always leaves behind, and the same thing the daemon tests.
+    bool is_late_inject = (args->runtime_flags & RuntimeFlags::LATE_INJECT) != 0 ||
+                          ipc_bridge.IsSystemServerRunning(env_);
+    // The real `serial` service is registered by then, and a lookup returning it would be
+    // indistinguishable from a successful rendezvous.
+    std::string bridgeServiceName = is_late_inject ? "serial_vector" : "serial";
     auto system_binder = ipc_bridge.RequestSystemServerBinder(env_, bridgeServiceName);
     if (!system_binder) {
         LOGE("Failed to get system server IPC binder. Aborting injection.");

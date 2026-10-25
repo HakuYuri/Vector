@@ -19,10 +19,22 @@ When a transaction occurs, the hook inspects the transaction code. If it matches
 
 ### Phase 1: System Server Initialization
 The `system_server` acts as the primary proxy router for the framework. During the `postServerSpecialize` callback, the following sequence occurs:
-1. The native module queries `ServiceManager` for the `serial` service (or `serial_vector` for late-inject scenarios). This service acts as a temporary rendezvous point.
+1. The native module queries `ServiceManager` for the rendezvous service, `serial` or `serial_vector` depending on whether a `system_server` was already running (see _Choosing the rendezvous name_ below).
 2. The module sends a `_VEC` transaction to retrieve a temporary binder, which it uses to fetch the framework DEX file descriptor and the obfuscation map.
 3. The module installs the JNI Binder Trap (`HookBridge`) and bootstraps the Kotlin layer via `Main.forkCommon`.
 4. Concurrently, the root daemon initiates a Binder transaction directly to the `system_server`. The JNI trap intercepts this, and BridgeService processes the `SEND_BINDER` action, storing the daemon's primary `IVectorDaemon` binder, sending back `system_server` context and linking a `DeathRecipient`.
+
+#### Choosing the rendezvous name
+`serial` is a real `system_server` service, registered long after specialization. At boot it is therefore free, and a binder found under it can only be the daemon's proxy. When Zygisk instead attaches to a `system_server` that booted without Vector, the real service is already registered, and a lookup returning it would be indistinguishable from a successful rendezvous; `serial_vector`, a name no platform service uses, is claimed for that case.
+
+Neither side is told which case it is in. Both ask the same question independently: does `activity` already answer? Nothing has registered it during a boot, and a running `system_server` always has. The module also honours Zygisk's own `LATE_INJECT` runtime flag where the implementation sets it, and falls back to the probe where it does not.
+
+`serial_vector` is the daemon's alone, so unlike `serial` nothing will ever come along and replace it. Once the module it existed for has let go of the binder, the daemon unregisters it through `registerClientCallback`, which is the only sequence servicemanager accepts — `tryUnregisterService` on its own is refused for as long as the service is marked as having a client, and for a name without a client callback that mark is never cleared.
+
+#### When `system_server` restarts
+A soft reboot, a crash or `ctl.restart zygote` leaves the daemon running and replaces the process it was talking to. The `DeathRecipient` the daemon linked on the `activity` binder is what notices, which is why that binder is retained for as long as the link is meant to last: the notification lives exactly as long as the `BinderProxy` it was registered on.
+
+The replacement is forked by a zygote that already carries Vector's hooks, so it arrives exactly as one does at boot and looks the daemon up under `serial`, which its predecessor freed by dying. The daemon re-claims `serial` on the death notification and stops treating itself as late-injected: the replacement broadcasts a boot of its own, so there is nothing to replay.
 
 ### Phase 2: User Application Rendezvous
 Standard applications initialize their IPC connection by routing requests through the `system_server`.

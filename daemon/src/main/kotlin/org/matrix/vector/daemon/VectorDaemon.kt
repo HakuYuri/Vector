@@ -44,8 +44,27 @@ object VectorDaemon {
   val scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + exceptionHandler)
   val bridgeServiceName = "activity"
 
-  var isLateInject = false
-  var proxyServiceName = "serial"
+  /**
+   * Whether a `system_server` was already serving the moment this daemon started, which is how
+   * Zygisk injecting into a booted system rather than into a fresh fork shows up on our side. The
+   * boot it missed then has to be replayed, and it has to be met under another name.
+   *
+   * Latched once during [main] and never revisited: by the time anything reads it a system_server
+   * is running either way, and what matters is which of the two we were started into.
+   */
+  var startedAfterSystemServer = false
+
+  /**
+   * The name the module looks the daemon up under while system_server is specialized. `serial` is
+   * free at boot, because system_server registers it only much later, so a binder found there can
+   * only be ours. On a booted system the real service holds it, and a lookup returning that is
+   * indistinguishable from a successful rendezvous, so a name of our own is used instead.
+   *
+   * Derived rather than stored: the two were separate fields until a restart moved one and left
+   * the other behind, and the daemon then waited under a name nothing would ever ask for.
+   */
+  val proxyServiceName: String
+    get() = if (startedAfterSystemServer) "serial_vector" else "serial"
 
   @JvmStatic
   fun main(args: Array<String>) {
@@ -55,13 +74,19 @@ object VectorDaemon {
     for (arg in args) {
       if (arg.startsWith("--system-server-max-retry=")) {
         systemServerMaxRetry = arg.substringAfter('=').toIntOrNull() ?: 1
-      } else if (arg == "--late-inject") {
-        isLateInject = true
-        proxyServiceName = "serial_vector"
       }
     }
 
-    Log.i(TAG, "Vector daemon started: lateInject=$isLateInject, proxy=$proxyServiceName")
+    // `activity` belongs to system_server, and at boot we are started beside a zygote that has yet
+    // to fork one. checkService, not getService: the latter blocks for seconds on an absent name
+    // before Android R, and absent is the boot path, where the module is already polling for the
+    // proxy we have not registered yet.
+    startedAfterSystemServer = ServiceManager.checkService(bridgeServiceName) != null
+
+    Log.i(
+        TAG,
+        "Vector daemon started: afterSystemServer=$startedAfterSystemServer, " +
+            "proxy=$proxyServiceName")
     // The hash is here rather than in the version the manager prints: Home should stay readable,
     // but every saved bug report should say exactly which commit produced the daemon that wrote it.
     Log.i(
@@ -191,6 +216,9 @@ object VectorDaemon {
 
           if (success) {
             Log.i(TAG, "Successfully injected Vector IPC binder for applications.")
+            // Only the name we invented for a late injection: `serial` is a real service name,
+            // and system_server registering it is what takes our proxy out of servicemanager.
+            if (startedAfterSystemServer) SystemServerService.unregisterProxyService()
           } else {
             Log.e(TAG, "Failed to inject VectorService into system_server")
             // Restarting is a recovery only when our module is in system_server and the
