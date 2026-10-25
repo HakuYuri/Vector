@@ -184,9 +184,19 @@ object VectorDaemon {
                   bridgeService.unlinkToDeath(this, 0)
                   clearSystemCaches()
                   SystemServerService.binderDied() // Cleanup old references
+                  // Nothing will look the invented name up again, so stop holding it.
+                  if (startedAfterSystemServer) SystemServerService.unregisterProxyService()
+                  // Whatever this daemon was started into, the replacement is forked by a zygote
+                  // that already carries our hooks, so it arrives the way one does at boot: it
+                  // looks us up under `serial`, which its predecessor has just freed by dying,
+                  // and it broadcasts a boot of its own that there is no need to replay.
+                  startedAfterSystemServer = false
+                  // And the question of whether a module reached system_server is about the one
+                  // ahead of us, not the one that died with ours inside it.
+                  SystemServerService.systemServerRequested = false
                   // Re-claim the service name immediately to ensure that when system_server
                   // restarts, our proxy is already there for the Zygisk module to find.
-                  ServiceManager.addService(proxyServiceName, SystemServerService)
+                  SystemServerService.registerProxyService(proxyServiceName)
                   ManagerService.guard = null // Remove dead guard
                   Handler(Looper.getMainLooper()).post {
                     sendToBridge(binder, true, restartRetry - 1)

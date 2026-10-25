@@ -41,7 +41,13 @@ private const val UNREGISTER_ATTEMPTS = 5
  */
 private object ServiceRegistrationWatcher {
 
+  private var watchedName: String? = null
+
   fun watch(serviceName: String) {
+    // servicemanager keeps every callback it is handed, and a system_server restart brings the
+    // daemon back through here; without this a long-lived daemon stacks up duplicates that all
+    // report the same registration.
+    if (watchedName == serviceName) return
     val callback =
         object : IServiceCallback.Stub() {
           // The IServiceCallback will tell us when the real Android service is ready,
@@ -55,6 +61,7 @@ private object ServiceRegistrationWatcher {
           override fun asBinder(): IBinder = this
         }
     runCatching { getSystemServiceManager().registerForNotifications(serviceName, callback) }
+        .onSuccess { watchedName = serviceName }
         .onFailure { Log.e(TAG, "Failed to register IServiceCallback", it) }
   }
 
