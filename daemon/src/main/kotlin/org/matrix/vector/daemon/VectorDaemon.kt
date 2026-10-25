@@ -66,16 +66,33 @@ object VectorDaemon {
   val proxyServiceName: String
     get() = if (startedAfterSystemServer) "serial_vector" else "serial"
 
+  /**
+   * The `activity` binder this daemon last linked its death recipient through.
+   *
+   * A death notification lives exactly as long as the `BinderProxy` it was registered on. Once
+   * [sendToBridge] returns nothing else refers to that proxy, and when ART collects it the kernel
+   * registration goes with it, silently: the daemon then sleeps through the next system_server
+   * restart, never re-claims the rendezvous, and the module that comes back finds nothing to meet.
+   * Holding the proxy here is what makes a daemon outlive the system_server it was started with,
+   * and dropping the link goes through this field rather than through the local it was taken
+   * from, so that a field only ever written cannot be optimised away along with the guarantee.
+   */
+  private var bridgeBinder: IBinder? = null
+
+  /** How many times [sendToBridge] may answer a failed handshake by restarting system_server. */
+  private var systemServerMaxRetry = 1
+  private var systemServerRestartBudget = 0
+
   @JvmStatic
   fun main(args: Array<String>) {
     if (!FileSystem.tryLock()) kotlin.system.exitProcess(0)
 
-    var systemServerMaxRetry = 1
     for (arg in args) {
       if (arg.startsWith("--system-server-max-retry=")) {
         systemServerMaxRetry = arg.substringAfter('=').toIntOrNull() ?: 1
       }
     }
+    systemServerRestartBudget = systemServerMaxRetry
 
     // `activity` belongs to system_server, and at boot we are started beside a zygote that has yet
     // to fork one. checkService, not getService: the latter blocks for seconds on an absent name
@@ -135,7 +152,7 @@ object VectorDaemon {
     val isVerboseLog = ManagerService.isVerboseLogEnabled()
 
     // Setup IPC channel for applications by injecting DaemonService binder
-    sendToBridge(VectorService.asBinder(), false, systemServerMaxRetry)
+    sendToBridge(VectorService.asBinder(), false)
 
     if (!isVerboseLog) {
       LogcatMonitor.stopVerbose()
@@ -154,11 +171,7 @@ object VectorDaemon {
 
   // The bridge is setup in `system_server` via Zygisk API
   @Suppress("DEPRECATION")
-  private fun sendToBridge(
-      binder: IBinder,
-      isRestart: Boolean,
-      restartRetry: Int,
-  ) {
+  private fun sendToBridge(binder: IBinder, isRestart: Boolean) {
     check(Looper.myLooper() == Looper.getMainLooper()) {
       "sendToBridge MUST run on the main thread!"
     }
@@ -181,7 +194,8 @@ object VectorDaemon {
               object : IBinder.DeathRecipient {
                 override fun binderDied() {
                   Log.w(TAG, "System Server died! Clearing caches and re-injecting...")
-                  bridgeService.unlinkToDeath(this, 0)
+                  bridgeBinder?.unlinkToDeath(this, 0)
+                  bridgeBinder = null
                   clearSystemCaches()
                   SystemServerService.binderDied() // Cleanup old references
                   // Nothing will look the invented name up again, so stop holding it.
@@ -198,12 +212,11 @@ object VectorDaemon {
                   // restarts, our proxy is already there for the Zygisk module to find.
                   SystemServerService.registerProxyService(proxyServiceName)
                   ManagerService.guard = null // Remove dead guard
-                  Handler(Looper.getMainLooper()).post {
-                    sendToBridge(binder, true, restartRetry - 1)
-                  }
+                  Handler(Looper.getMainLooper()).post { sendToBridge(binder, true) }
                 }
               }
           bridgeService.linkToDeath(deathRecipient, 0)
+          bridgeBinder = bridgeService // see [bridgeBinder]: the link is only as alive as this
 
           // Try sending the Binder payload (up to 3 times)
           var success = false
@@ -226,6 +239,9 @@ object VectorDaemon {
 
           if (success) {
             Log.i(TAG, "Successfully injected Vector IPC binder for applications.")
+            // The budget is for a run of failures, not for a long life: a daemon that keeps
+            // injecting across soft reboot after soft reboot should not run out of them.
+            systemServerRestartBudget = systemServerMaxRetry
             // Only the name we invented for a late injection: `serial` is a real service name,
             // and system_server registering it is what takes our proxy out of servicemanager.
             if (startedAfterSystemServer) SystemServerService.unregisterProxyService()
@@ -244,7 +260,11 @@ object VectorDaemon {
             when {
               !SystemServerService.systemServerRequested ->
                   Log.e(TAG, "No Vector module reached system_server; leaving it running")
-              restartRetry > 0 -> restartSystemServer()
+              systemServerRestartBudget > 0 -> {
+                systemServerRestartBudget--
+                restartSystemServer()
+              }
+              else -> Log.e(TAG, "Out of system_server restarts; leaving it running")
             }
           }
         }
