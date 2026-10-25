@@ -79,20 +79,9 @@ object VectorDaemon {
    */
   private var bridgeBinder: IBinder? = null
 
-  /** How many times [sendToBridge] may answer a failed handshake by restarting system_server. */
-  private var systemServerMaxRetry = 1
-  private var systemServerRestartBudget = 0
-
   @JvmStatic
   fun main(args: Array<String>) {
     if (!FileSystem.tryLock()) kotlin.system.exitProcess(0)
-
-    for (arg in args) {
-      if (arg.startsWith("--system-server-max-retry=")) {
-        systemServerMaxRetry = arg.substringAfter('=').toIntOrNull() ?: 1
-      }
-    }
-    systemServerRestartBudget = systemServerMaxRetry
 
     // `activity` belongs to system_server, and at boot we are started beside a zygote that has yet
     // to fork one. checkService, not getService: the latter blocks for seconds on an absent name
@@ -239,32 +228,27 @@ object VectorDaemon {
 
           if (success) {
             Log.i(TAG, "Successfully injected Vector IPC binder for applications.")
-            // The budget is for a run of failures, not for a long life: a daemon that keeps
-            // injecting across soft reboot after soft reboot should not run out of them.
-            systemServerRestartBudget = systemServerMaxRetry
             // Only the name we invented for a late injection: `serial` is a real service name,
             // and system_server registering it is what takes our proxy out of servicemanager.
             if (startedAfterSystemServer) SystemServerService.unregisterProxyService()
           } else {
-            Log.e(TAG, "Failed to inject VectorService into system_server")
-            // Restarting is a recovery only when our module is in system_server and the
-            // handshake went wrong, because the replacement is specialized by the same hooked
-            // zygote and gets another try. When no module reached system_server in the first
-            // place the hooks are not there, so every restart takes the user's screen down and
-            // arrives back here; the retry budget then spends itself on a row of them.
+            // Nothing is restarted over this. By the time the loop above transacts, `activity`
+            // has answered a ping, and the module's fate was settled well before that: its
+            // hooks go in during specialization, before system_server registers a service. A
+            // bridge that does not answer is not a race that another boot would win.
             //
-            // `systemServerRequested` separates the two: the module latches it from inside
-            // `postServerSpecialize`, which runs before system_server starts a single service,
-            // while the loop above only transacts once `activity` answers a ping. So a live
-            // `activity` with no handshake behind it means no module, not a race.
-            when {
-              !SystemServerService.systemServerRequested ->
-                  Log.e(TAG, "No Vector module reached system_server; leaving it running")
-              systemServerRestartBudget > 0 -> {
-                systemServerRestartBudget--
-                restartSystemServer()
-              }
-              else -> Log.e(TAG, "Out of system_server restarts; leaving it running")
+            // It would also be the wrong price to pay for one. Every system_server start is a
+            // boot to PackageWatchdog, which escalates a mitigation count that lives on disk
+            // and never goes down, and far enough along that ladder the mitigation stops being
+            // a reboot: the device is sent to recovery to be asked whether to erase itself.
+            //
+            // The two cases are still worth telling apart for whoever reads the log afterwards.
+            // `systemServerRequested` is latched from inside `postServerSpecialize`, so a live
+            // `activity` with nothing behind it means no module arrived at all.
+            if (!SystemServerService.systemServerRequested) {
+              Log.e(TAG, "No Vector module reached system_server; leaving it running")
+            } else {
+              Log.e(TAG, "Vector reached system_server but its bridge never answered")
             }
           }
         }
@@ -307,25 +291,39 @@ object VectorDaemon {
    *
    * `system_server` is forked from the *primary* zygote, so restarting that is what restarts the
    * framework — on a 64/32 device the primary init service is still called `zygote` (it runs
-   * app_process64) and `zygote_secondary` is the 32-bit one. Restarting the secondary leaves
-   * system_server running, which is right for [restartSystemServer]'s own purpose and wrong for
-   * this one; they are separate functions for that reason.
+   * app_process64) and `zygote_secondary` is the 32-bit one.
    *
-   * Everything on screen dies with it. The caller is expected to have said so first.
+   * Everything on screen dies with it. The caller is expected to have said so first, which is
+   * also what tells this apart from a boot loop — see [forgetDeliberateBoot].
    */
   fun softReboot() {
     Log.w(TAG, "Soft reboot: restarting the primary zygote")
+    forgetDeliberateBoot()
     SystemProperties.set("ctl.restart", "zygote")
   }
 
-  fun restartSystemServer() {
-    Log.w(TAG, "Restarting system_server...")
-    val restartTarget =
-        if (Build.SUPPORTED_64_BIT_ABIS.isNotEmpty() && Build.SUPPORTED_32_BIT_ABIS.isNotEmpty()) {
-          "zygote_secondary"
-        } else {
-          "zygote"
-        }
-    SystemProperties.set("ctl.restart", restartTarget)
+  /**
+   * Takes the boot we are about to cause back out of PackageWatchdog's count.
+   *
+   * It counts every system_server start alike, having no way to tell one that was asked for from
+   * one a crash loop produced, and each time enough of them land close together it raises a
+   * mitigation count that is kept on disk and never lowered. Far enough along that ladder the
+   * mitigation stops being a reboot: the device goes to recovery to be asked whether to erase
+   * itself. A soft reboot does not clear the window count either, because init and its
+   * properties live through one, so deliberate restarts pile up exactly as failures would.
+   *
+   * Zeroing the window count immediately before restarting cancels the single tick we are about
+   * to add and nothing else. A real loop around us starts counting again from here and still
+   * trips, which is the point: we only vouch for the boot we asked for ourselves.
+   */
+  private fun forgetDeliberateBoot() {
+    // Two names for one counter: RescueParty read `sys.rescue_boot_count` directly until the
+    // CrashRecovery mainline module moved it behind generated accessors and onto the
+    // `crashrecovery.` prefix. Both are cleared because the daemon supports both eras, and
+    // writing the name a platform does not use costs nothing.
+    for (property in arrayOf("crashrecovery.rescue_boot_count", "sys.rescue_boot_count")) {
+      runCatching { SystemProperties.set(property, "0") }
+          .onFailure { Log.w(TAG, "Could not clear `$property` before restarting", it) }
+    }
   }
 }
