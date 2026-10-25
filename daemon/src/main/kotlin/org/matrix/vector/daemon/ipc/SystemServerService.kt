@@ -3,29 +3,16 @@ package org.matrix.vector.daemon.ipc
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.IClientCallback
 import android.os.IServiceCallback
 import android.os.Parcel
 import android.os.ServiceManager
 import android.util.Log
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import org.matrix.vector.ipc.IFrameworkService
 import org.matrix.vector.daemon.*
 import org.matrix.vector.daemon.system.getSystemServiceManager
 
 private const val TAG = "VectorSystemServer"
-
-/**
- * How long to leave between attempts at dropping the proxy, and how many to make.
- *
- * servicemanager marks a service the moment it hands the binder out and refuses to unregister it
- * until that mark is cleared, which it does from a five second interval of its own. Asking once,
- * straight after the handshake, therefore always lands inside the mark; these space the asking out
- * across a few of those intervals instead.
- */
-private const val UNREGISTER_RETRY_MILLIS = 6_000L
-private const val UNREGISTER_ATTEMPTS = 5
 
 /**
  * The Android R half of [SystemServerService.registerProxyService], in a class of its own on
@@ -41,7 +28,9 @@ private const val UNREGISTER_ATTEMPTS = 5
  */
 private object ServiceRegistrationWatcher {
 
-  private var watchedName: String? = null
+  // Written from the main thread at startup and from a binder thread when system_server dies.
+  @Volatile private var watchedName: String? = null
+  @Volatile private var unusedName: String? = null
 
   fun watch(serviceName: String) {
     // servicemanager keeps every callback it is handed, and a system_server restart brings the
@@ -65,8 +54,35 @@ private object ServiceRegistrationWatcher {
         .onFailure { Log.e(TAG, "Failed to register IServiceCallback", it) }
   }
 
-  fun unregister(serviceName: String, binder: IBinder) {
-    getSystemServiceManager().tryUnregisterService(serviceName, binder)
+  /**
+   * Asks servicemanager to drop [serviceName] once nothing but itself is holding [binder].
+   *
+   * It will not drop a service on request alone. `tryUnregisterService` refuses outright while
+   * the service is marked as having a client on the way, which handing the binder out is what
+   * sets, and the only code that clears that mark returns early for any name without a client
+   * callback — so for a service registered the ordinary way the mark is permanent and the
+   * refusal is forever. Asking repeatedly changes nothing.
+   *
+   * Registering a callback is what puts the name on servicemanager's interval, which then clears
+   * the mark and, once the last client is gone, says so. Unregistering from inside that is how a
+   * lazy service shuts itself down, and it is the only sequence servicemanager accepts.
+   */
+  fun unregisterWhenUnused(serviceName: String, binder: IBinder) {
+    if (unusedName == serviceName) return
+    val callback =
+        object : IClientCallback.Stub() {
+          override fun onClients(registered: IBinder, hasClients: Boolean) {
+            if (hasClients) return
+            runCatching { getSystemServiceManager().tryUnregisterService(serviceName, registered) }
+                .onSuccess { Log.d(TAG, "Dropped the proxy service `$serviceName`") }
+                .onFailure { Log.d(TAG, "Proxy service `$serviceName` stays registered: $it") }
+          }
+
+          override fun asBinder(): IBinder = this
+        }
+    runCatching { getSystemServiceManager().registerClientCallback(serviceName, binder, callback) }
+        .onSuccess { unusedName = serviceName }
+        .onFailure { Log.d(TAG, "Proxy service `$serviceName` stays registered: $it") }
   }
 }
 
@@ -83,7 +99,6 @@ object SystemServerService : Binder(), IBinder.DeathRecipient {
 
   private var proxyServiceName: String? = null
   private var originService: IBinder? = null
-  private var unregisterJob: Job? = null
 
   var systemServerRequested = false
 
@@ -107,34 +122,17 @@ object SystemServerService : Binder(), IBinder.DeathRecipient {
   }
 
   /**
-   * Drops our proxy from servicemanager, once the module it was there for has been served.
+   * Arranges for our proxy to leave servicemanager once the module it was there for is done with
+   * it; see [ServiceRegistrationWatcher.unregisterWhenUnused] for why it cannot simply be asked.
    *
-   * Best effort, and asked more than once: `tryUnregisterService` arrived in Android R, and
-   * servicemanager refuses while the service is still marked as having a client on the way, which
-   * the handshake we have just finished is exactly what put there. See [UNREGISTER_RETRY_MILLIS].
-   *
-   * Worth the trouble because the name invented for a late injection is ours alone, so unlike
-   * `serial` nothing will ever come along and replace it. A refusal costs nothing: the name stays
-   * registered, as it did before any of this.
+   * Worth arranging because the name invented for a late injection is ours alone, so unlike
+   * `serial` nothing will ever come along and replace it. Android R and later; before that the
+   * name stays registered, as it did before any of this.
    */
   fun unregisterProxyService() {
-    val name = proxyServiceName ?: return
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-    unregisterJob?.cancel()
-    unregisterJob =
-        VectorDaemon.scope.launch {
-          repeat(UNREGISTER_ATTEMPTS) { attempt ->
-            if (attempt > 0) delay(UNREGISTER_RETRY_MILLIS)
-            val failure =
-                runCatching { ServiceRegistrationWatcher.unregister(name, SystemServerService) }
-                    .exceptionOrNull()
-            if (failure == null) {
-              Log.d(TAG, "Dropped the proxy service `$name`")
-              return@launch
-            }
-            Log.d(TAG, "Proxy service `$name` stays registered: $failure")
-          }
-        }
+    val name = proxyServiceName ?: return
+    ServiceRegistrationWatcher.unregisterWhenUnused(name, this)
   }
 
   /**
@@ -205,10 +203,6 @@ object SystemServerService : Binder(), IBinder.DeathRecipient {
   }
 
   override fun binderDied() {
-    // A pending attempt belongs to the handshake of the system_server that has just died. The
-    // caller re-claims the name for its replacement right after this, and dropping that
-    // registration would leave the replacement with nowhere to meet us.
-    unregisterJob?.cancel()
     originService?.unlinkToDeath(this, 0)
     originService = null
   }
