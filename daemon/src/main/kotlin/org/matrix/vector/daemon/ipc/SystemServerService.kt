@@ -100,7 +100,9 @@ object SystemServerService : Binder(), IBinder.DeathRecipient {
   private var proxyServiceName: String? = null
   private var originService: IBinder? = null
 
-  var systemServerRequested = false
+  // Latched from a binder thread when system_server attaches, cleared from another when it dies,
+  // and read on the daemon's main thread.
+  @Volatile var systemServerRequested = false
 
   fun registerProxyService(serviceName: String) {
     // Register as the service name early to setup an IPC for `system_server`.
@@ -126,8 +128,8 @@ object SystemServerService : Binder(), IBinder.DeathRecipient {
    * it; see [ServiceRegistrationWatcher.unregisterWhenUnused] for why it cannot simply be asked.
    *
    * Worth arranging because the name invented for a late injection is ours alone, so unlike
-   * `serial` nothing will ever come along and replace it. Android R and later; before that the
-   * name stays registered, as it did before any of this.
+   * `serial` nothing will ever come along and replace it. Android R and later; older
+   * servicemanagers offer no way to take a name back, and there it stays registered.
    */
   fun unregisterProxyService() {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return

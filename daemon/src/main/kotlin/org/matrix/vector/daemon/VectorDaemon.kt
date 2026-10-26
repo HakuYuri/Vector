@@ -49,10 +49,10 @@ object VectorDaemon {
    * Zygisk injecting into a booted system rather than into a fresh fork shows up on our side. The
    * boot it missed then has to be replayed, and it has to be met under another name.
    *
-   * Latched once during [main] and never revisited: by the time anything reads it a system_server
-   * is running either way, and what matters is which of the two we were started into.
+   * Set on the main thread during [main] and cleared by the death recipient on a binder thread,
+   * which is what the `@Volatile` is for.
    */
-  var startedAfterSystemServer = false
+  @Volatile var startedAfterSystemServer = false
 
   /**
    * The name the module looks the daemon up under while system_server is specialized. `serial` is
@@ -60,8 +60,8 @@ object VectorDaemon {
    * only be ours. On a booted system the real service holds it, and a lookup returning that is
    * indistinguishable from a successful rendezvous, so a name of our own is used instead.
    *
-   * Derived rather than stored: the two were separate fields until a restart moved one and left
-   * the other behind, and the daemon then waited under a name nothing would ever ask for.
+   * Computed from [startedAfterSystemServer] rather than stored beside it, so that the single
+   * place a restart changes its mind about the rendezvous is the place the name is read from.
    */
   val proxyServiceName: String
     get() = if (startedAfterSystemServer) "serial_vector" else "serial"
@@ -73,11 +73,11 @@ object VectorDaemon {
    * [sendToBridge] returns nothing else refers to that proxy, and when ART collects it the kernel
    * registration goes with it, silently: the daemon then sleeps through the next system_server
    * restart, never re-claims the rendezvous, and the module that comes back finds nothing to meet.
-   * Holding the proxy here is what makes a daemon outlive the system_server it was started with,
-   * and dropping the link goes through this field rather than through the local it was taken
-   * from, so that a field only ever written cannot be optimised away along with the guarantee.
+   * Holding the proxy here is what lets a daemon outlive the system_server it was started with.
+   * The link is dropped through this field too, so the reference that keeps the notification
+   * alive is the same one that releases it.
    */
-  private var bridgeBinder: IBinder? = null
+  @Volatile private var bridgeBinder: IBinder? = null
 
   @JvmStatic
   fun main(args: Array<String>) {
@@ -232,10 +232,10 @@ object VectorDaemon {
             // and system_server registering it is what takes our proxy out of servicemanager.
             if (startedAfterSystemServer) SystemServerService.unregisterProxyService()
           } else {
-            // Nothing is restarted over this. By the time the loop above transacts, `activity`
-            // has answered a ping, and the module's fate was settled well before that: its
-            // hooks go in during specialization, before system_server registers a service. A
-            // bridge that does not answer is not a race that another boot would win.
+            // A bridge that does not answer is no reason to restart system_server. By the time
+            // the loop above transacts, `activity` has answered a ping, and the module's fate was
+            // settled well before that: its hooks go in during specialization, before
+            // system_server registers a service. This is not a race that another boot would win.
             //
             // It would also be the wrong price to pay for one. Every system_server start is a
             // boot to PackageWatchdog, which escalates a mitigation count that lives on disk
