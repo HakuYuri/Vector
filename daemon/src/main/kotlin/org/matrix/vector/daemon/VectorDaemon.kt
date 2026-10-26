@@ -232,14 +232,15 @@ object VectorDaemon {
             // and system_server registering it is what takes our proxy out of servicemanager.
             if (startedAfterSystemServer) SystemServerService.unregisterProxyService()
           } else {
-            // A bridge that does not answer is no reason to restart system_server. By the time
-            // the loop above transacts, `activity` has answered a ping, and the module's fate was
-            // settled well before that: its hooks go in during specialization, before
-            // system_server registers a service. This is not a race that another boot would win.
+            // system_server is not restarted here. Restarting it has never been shown to
+            // recover an injection: the module's hooks go in during specialization, long
+            // before the bridge that would be restarted over, so a handshake failing this
+            // late is a bug in the injection or the bootstrap. A restart hides that bug
+            // until someone fixes it, which is the argument against keeping one.
             //
-            // It would also be the wrong price to pay for one. Every system_server start is a
-            // boot to PackageWatchdog, which escalates a mitigation count that lives on disk
-            // and never goes down, and far enough along that ladder the mitigation stops being
+            // It is not free to keep around either. Every system_server start is a boot to
+            // PackageWatchdog, which escalates a mitigation count that lives on disk and
+            // never goes down, and far enough along that ladder the mitigation stops being
             // a reboot: the device is sent to recovery to be asked whether to erase itself.
             //
             // The two cases are still worth telling apart for whoever reads the log afterwards.
