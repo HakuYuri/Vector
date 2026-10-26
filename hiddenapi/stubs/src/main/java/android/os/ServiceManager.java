@@ -16,8 +16,7 @@ public class ServiceManager {
     }
 
     /**
-     * Returns the service with the given name if servicemanager already holds one, without
-     * asking for it to be started.
+     * Returns a reference to a service with the given name if one is already registered.
      *
      * @param name the name of the service to get
      * @return a reference to the service, or <code>null</code> if the service doesn't exist

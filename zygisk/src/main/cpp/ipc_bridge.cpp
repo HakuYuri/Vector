@@ -157,9 +157,8 @@ void IPCBridge::Initialize(JNIEnv *env) {
         LOGE("IPCBridge: ServiceManager.getService method not found!");
         return;
     }
-    // IsSystemServerRunning needs it: checkService reports what servicemanager already holds,
-    // where getService may also try to start the service behind the name. Its absence costs only
-    // the probe, leaving the LATE_INJECT flag to answer on its own.
+    // IsSystemServerRunning needs it: checkService asks servicemanager whether it holds the
+    // name now. Its absence costs only the probe, leaving LATE_INJECT to answer on its own.
     check_service_method_ = lsplant::JNI_GetStaticMethodID(
         env, service_manager_class_, "checkService", "(Ljava/lang/String;)Landroid/os/IBinder;");
     if (!check_service_method_) {

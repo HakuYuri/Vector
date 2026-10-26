@@ -85,8 +85,8 @@ object VectorDaemon {
 
     // `activity` is system_server's own, registered long after the specialization in which the
     // module comes looking for us, so at boot nothing answers it and a binder there means someone
-    // booted without us. checkService, not getService: it reports what servicemanager already
-    // holds, where getService may also try to start the service behind the name.
+    // booted without us. checkService is that question by its own name: does servicemanager hold
+    // this one now.
     startedAfterSystemServer = ServiceManager.checkService(bridgeServiceName) != null
 
     Log.i(
