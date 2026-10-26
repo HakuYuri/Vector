@@ -83,10 +83,10 @@ object VectorDaemon {
   fun main(args: Array<String>) {
     if (!FileSystem.tryLock()) kotlin.system.exitProcess(0)
 
-    // `activity` belongs to system_server, and at boot we are started beside a zygote that has yet
-    // to fork one. checkService, not getService: the latter blocks for seconds on an absent name
-    // before Android R, and absent is the boot path, where the module is already polling for the
-    // proxy we have not registered yet.
+    // `activity` is system_server's own, registered long after the specialization in which the
+    // module comes looking for us, so at boot nothing answers it and a binder there means someone
+    // booted without us. checkService, not getService: it reports what servicemanager already
+    // holds, where getService may also try to start the service behind the name.
     startedAfterSystemServer = ServiceManager.checkService(bridgeServiceName) != null
 
     Log.i(

@@ -20,7 +20,8 @@ object Main {
      *
      * @param isSystem True if this is the system_server process.
      * @param isLateInject True if Zygisk injected us into a system_server that was already
-     *   running, so the boot it missed has to be replayed rather than awaited.
+     *   running, which is past the points the hooks would have caught, so the startup they drive
+     *   is run by hand instead.
      * @param niceName The process name (e.g., package name or "system").
      * @param appDir The application's data directory.
      * @param binder The Binder token associated with the application service.
