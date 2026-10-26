@@ -158,7 +158,8 @@ void IPCBridge::Initialize(JNIEnv *env) {
         return;
     }
     // IsSystemServerRunning needs it: getService blocks for seconds on an absent name before
-    // Android R, which is precisely the case it asks about. Optional, the probe copes without it.
+    // Android R, which is precisely the case it asks about. Its absence costs only the probe,
+    // leaving the LATE_INJECT flag to answer on its own.
     check_service_method_ = lsplant::JNI_GetStaticMethodID(
         env, service_manager_class_, "checkService", "(Ljava/lang/String;)Landroid/os/IBinder;");
     if (!check_service_method_) {
