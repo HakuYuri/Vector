@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "exec_guard.h"
 #include "logging.h"
 
 // Access to the process environment variables
@@ -109,6 +110,12 @@ void write_int(int fd, int val) {
 }  // namespace
 
 int main(int argc, char **argv) {
+    // A daemon restarted over an old bind mount may hand us this wrapper as the
+    // stock compiler. Stop same-process re-exec BEFORE IPC or another hook memfd.
+    if (!vector_dex2oat::enter_exec_guard()) {
+        LOGE("Refusing recursive dex2oat wrapper execution (pid=%d)", getpid());
+        return 1;
+    }
     LOGD("dex2oat wrapper ppid=%d", getppid());
 
     // Prepare Unix domain socket address (Abstract Namespace)
@@ -134,6 +141,14 @@ int main(int argc, char **argv) {
     read_int(sock_fd);  // Sync
     close(sock_fd);
 
+    struct stat stock{};
+    if (stock_fd < 0 || fstat(stock_fd, &stock) != 0 || !S_ISREG(stock.st_mode) ||
+        stock.st_size == 0) {
+        LOGE("Invalid stock dex2oat descriptor");
+        if (stock_fd >= 0) close(stock_fd);
+        return 1;
+    }
+
     // 2. Get liboat_hook.so FD
     sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (connect(sock_fd, reinterpret_cast<struct sockaddr *>(&sock), len)) {
@@ -148,6 +163,8 @@ int main(int argc, char **argv) {
 
     if (hooker_fd == -1) {
         LOGE("failed to read liboat_hook.so");
+        close(stock_fd);
+        return 1;
     } else {
         int mem_fd = syscall(__NR_memfd_create, "liboat_hook_memfd", 0);
         if (mem_fd >= 0) {
